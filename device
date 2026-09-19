@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 main.py -- IoT Emergency Device Simulator ("Golden Hour System" field unit)
  
@@ -22,11 +21,12 @@ SETUP
  
 2. Install dependencies (Python 3.9+):
  
-     pip install opencv-python websockets SpeechRecognition pyttsx3 requests pyaudio
+     python -m pip install -r requirements.txt
+     python -m pip install -r requirements-audio.txt  # optional microphone support
  
    Platform notes:
      - PyAudio (needed by SpeechRecognition for mic access):
-         Windows : `pip install pyaudio`, or if that fails,
+         Windows : `python -m pip install pyaudio`, or if that fails,
                    `pip install pipwin && pipwin install pyaudio`
          macOS   : `brew install portaudio` first, then `pip install pyaudio`
          Linux   : `sudo apt-get install portaudio19-dev python3-pyaudio`
@@ -70,24 +70,61 @@ import time
  
 try:
     import cv2
+except ImportError:
+    cv2 = None
+
+try:
     import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+try:
     import requests
+except ImportError:
+    requests = None
+
+try:
     import speech_recognition as sr
+except ImportError:
+    sr = None
+
+try:
     import websockets
-except ImportError as exc:
-    print(
-        "Missing device dependency. Install the device packages with:\n"
-        "python -m pip install opencv-python websockets "
-        "SpeechRecognition pyttsx3 requests"
-    )
-    print(f"Import error: {exc}")
-    raise SystemExit(1)
+except ImportError:
+    websockets = None
+
+
+def report_missing_dependencies() -> None:
+    missing = []
+    if cv2 is None:
+        missing.append("opencv-python")
+    if websockets is None:
+        missing.append("websockets")
+    if pyttsx3 is None:
+        missing.append("pyttsx3")
+    if requests is None:
+        missing.append("requests")
+    if sr is None:
+        missing.append("SpeechRecognition")
+
+    if missing:
+        print(
+            "Missing device dependencies: "
+            + ", ".join(missing)
+            + "\nInstall them with:\n"
+            + "python -m pip install "
+            + " ".join(missing)
+        )
+        raise SystemExit(1)
+
+
+report_missing_dependencies()
  
 # ======================================================================
 # CONFIGURATION -- edit these for your setup
 # ======================================================================
  
-HOSPITAL_IP = "172.17.209.245"      # <-- set to the hospital server's LAN IP
+HOSPITAL_IP = "192.168.1.X"      # <-- set to Laptop 1's LAN IP
 HOSPITAL_PORT = 8000
  
 WS_URL = f"ws://{HOSPITAL_IP}:{HOSPITAL_PORT}/ws/video?role=device"
@@ -96,10 +133,10 @@ CHAT_URL = f"http://{HOSPITAL_IP}:{HOSPITAL_PORT}/api/chat"
 DEVICE_ID = "field-unit-01"      # identifies this device to the server
  
 CAMERA_INDEX = 0
-TARGET_FPS = 10                  # video frames sent per second
-JPEG_QUALITY = 70                # 0-100; lower = smaller/faster, blurrier
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+TARGET_FPS = 15                  # video frames sent per second
+JPEG_QUALITY = 55                # smaller frames reduce LAN latency
+FRAME_WIDTH = 480
+FRAME_HEIGHT = 360
  
 RECONNECT_DELAY_SECONDS = 5      # wait before retrying a dropped connection
 REQUEST_TIMEOUT_SECONDS = 15     # timeout for HTTP calls to the chat API
@@ -134,6 +171,19 @@ def video_thread_main() -> None:
  
  
 async def video_stream_loop() -> None:
+    if cv2 is None:
+        log.error(
+            "Video disabled: install opencv-python with "
+            "'python -m pip install opencv-python'."
+        )
+        return
+    if websockets is None:
+        log.error(
+            "Video disabled: install websockets with "
+            "'python -m pip install websockets'."
+        )
+        return
+
     frame_interval = 1.0 / TARGET_FPS
     while not shutdown_event.is_set():
         cap = open_camera()
@@ -174,6 +224,7 @@ async def video_stream_loop() -> None:
  
 def open_camera() -> cv2.VideoCapture | None:
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     if not cap.isOpened():
@@ -185,18 +236,16 @@ def open_camera() -> cv2.VideoCapture | None:
 async def send_frames(cap: cv2.VideoCapture, ws, frame_interval: float) -> None:
     """Read frames off the camera and push them over an already-open WebSocket."""
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
- 
+
     while not shutdown_event.is_set():
         start = time.monotonic()
- 
-        # cap.read()/imencode() are blocking C calls -- run them off the
-        # event loop thread so they don't stall the connection's keepalive.
+
         ok, frame = await asyncio.to_thread(cap.read)
         if not ok:
             log.warning("Failed to read a frame from the camera; retrying.")
             await asyncio.sleep(0.5)
             continue
- 
+
         ok, buffer = await asyncio.to_thread(cv2.imencode, ".jpg", frame, encode_params)
         if not ok:
             log.warning("Failed to JPEG-encode a frame; skipping.")
@@ -223,9 +272,9 @@ async def send_frames(cap: cv2.VideoCapture, ws, frame_interval: float) -> None:
             2,
             cv2.LINE_AA,
         )
-        cv2.imshow("Golden Hour - Patient View", display_frame)
+        cv2.imshow("GHS Emergency Display", display_frame)
         cv2.waitKey(1)
- 
+
         payload = json.dumps({
             "type": "frame",
             "device_id": DEVICE_ID,
@@ -233,11 +282,9 @@ async def send_frames(cap: cv2.VideoCapture, ws, frame_interval: float) -> None:
             "encoding": "jpeg-base64",
             "data": base64.b64encode(buffer).decode("ascii"),
         })
- 
-        # A dropped connection raises here and propagates up to the
-        # reconnect loop in video_stream_loop().
+
         await ws.send(payload)
- 
+
         elapsed = time.monotonic() - start
         await asyncio.sleep(max(0.0, frame_interval - elapsed))
  
@@ -255,6 +302,19 @@ def audio_thread_main() -> None:
  
  
 def run_audio_loop() -> None:
+    if sr is None:
+        log.error(
+            "Audio disabled: install SpeechRecognition and its audio backend "
+            "with 'python -m pip install SpeechRecognition PyAudio'."
+        )
+        return
+    if requests is None:
+        log.error(
+            "Audio chat disabled: install requests with "
+            "'python -m pip install requests'."
+        )
+        return
+
     recognizer = sr.Recognizer()
     tts_engine = init_tts_engine()
  
@@ -264,9 +324,13 @@ def run_audio_loop() -> None:
         log.exception("Could not open a microphone -- audio loop disabled.")
         return
  
-    with microphone as source:
-        log.info("Calibrating for ambient noise...")
-        recognizer.adjust_for_ambient_noise(source, duration=1)
+    try:
+        with microphone as source:
+            log.info("Calibrating for ambient noise...")
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+    except OSError:
+        log.exception("Microphone calibration failed -- audio loop disabled.")
+        return
  
     log.info("Listening for speech...")
     while not shutdown_event.is_set():
@@ -312,10 +376,14 @@ def listen_for_speech(recognizer: sr.Recognizer, microphone: sr.Microphone) -> s
  
 def send_to_chat_api(text: str) -> str | None:
     """POSTs transcribed text to the hospital chat endpoint and returns its reply."""
+    if requests is None:
+        log.error("Chat request skipped because requests is not installed.")
+        return None
+
     try:
         response = requests.post(
             CHAT_URL,
-            json={"device_id": DEVICE_ID, "text": text, "timestamp": time.time()},
+            json={"message": text},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -337,6 +405,13 @@ def send_to_chat_api(text: str) -> str | None:
  
  
 def init_tts_engine():
+    if pyttsx3 is None:
+        log.warning(
+            "Text-to-speech unavailable: install pyttsx3 with "
+            "'python -m pip install pyttsx3'."
+        )
+        return None
+
     try:
         return pyttsx3.init()
     except Exception:
@@ -362,6 +437,13 @@ def speak(engine, text: str) -> None:
 def main() -> None:
     log.info("Starting Golden Hour field device (%s)", DEVICE_ID)
     log.info("Hospital server: %s:%s", HOSPITAL_IP, HOSPITAL_PORT)
+    if not HOSPITAL_IP or HOSPITAL_IP.endswith(".X"):
+        log.error(
+            "Set HOSPITAL_IP to Laptop 1's LAN address before starting "
+            "(current value: %r).",
+            HOSPITAL_IP,
+        )
+        return
  
     threads = [
         threading.Thread(target=video_thread_main, name="VideoThread", daemon=True),
@@ -373,18 +455,21 @@ def main() -> None:
     def handle_shutdown(signum, frame):
         log.info("Shutdown signal received, stopping...")
         shutdown_event.set()
- 
+
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
- 
+
     try:
         while not shutdown_event.is_set():
             time.sleep(0.5)
     except KeyboardInterrupt:
         shutdown_event.set()
 
-    cv2.destroyAllWindows()
- 
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
     log.info("Waiting for threads to exit...")
     for t in threads:
         t.join(timeout=5)
