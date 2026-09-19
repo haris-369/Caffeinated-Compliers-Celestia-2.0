@@ -1,29 +1,43 @@
-# ☕ Caffeinated Compilers | Celestia 2.0
+<div align="center">
 
-> *A brief, 1-2 sentence tagline explaining what your project does and who it helps.*
+# ☕ GHS: Golden Hour System
 
-## 🚀 The Problem We Are Solving
-(Explain the specific track or issue you are tackling. Keep it concise and impactful.)
+### A compact IoT emergency communication device that connects a person in distress to an AI assistant and, when available, a remote doctor, with live voice, video and location.[cite: 2]
+
+![Hackathon](https://img.shields.io/badge/Hackathon-Celestia_2.0-blueviolet)
+![Status](https://img.shields.io/badge/Status-Prototype-orange)
+
+</div>
+
+---
+
+## 🚀 The Problem
+The first hour after a medical emergency, the "golden hour", is when timely action matters most[cite: 3]. But the person in distress is often alone or surrounded by untrained bystanders, and no doctor can see or hear what is happening[cite: 3]. Responders arrive without a clear picture of the patient's condition or exact location, while the patient waits without guidance[cite: 3]. Meanwhile, many IoT health devices stop at measuring vitals—they generate data, but they do not connect the person to anyone who can act on it[cite: 3].
 
 ## 💡 Our Solution
-(Describe your application/prototype. How does it work? What are its core features?)
+GHS bridges the communication gap during the golden hour[cite: 3]. It is a compact IoT device that connects a person in distress with an AI assistant and, when available, a doctor, with live location, voice and video[cite: 3].
 
-## 🛠️ Tech Stack
-*   **Frontend:** (e.g., React, Tailwind)
-*   **Backend:** (e.g., Node.js, Express)
-*   **Database:** (e.g., MongoDB, PostgreSQL)
-*   **Hardware/Cloud:** (e.g., Arduino, AWS, Firebase)
+### Key Features
+* **Emergency Triggered:** GHS activates and sends its GPS location to the backend[cite: 3].
+* **AI First Response:** Voice AI gives safety-oriented, non-diagnostic first-response guidance (`Mic → Speech-to-Text → AI → Text-to-Speech → Speaker`)[cite: 2, 3].
+* **Doctor Joins:** Camera, display, mic and speaker become a two-way telemedicine link to a browser dashboard using WebRTC[cite: 2, 3].
+* **GPS Coordination:** Live GPS powers navigation, hospital search and ambulance coordination[cite: 3].
 
-## ⚙️ How to Run Locally
-1. Clone the repository: `git clone https://github.com/haris-369/Caffeinated-Compliers-Celestia-2.0.git`
-2. Navigate to the backend directory and install dependencies: `cd backend && npm install`
-3. Start the server: `npm start`
-4. (Add any other necessary steps for frontend or database setup)
+## ⚙️ Architecture
+The physical device stays small; the AI, hospital search, emergency coordination, navigation, summarization, and communication logic happen in the cloud/backend[cite: 5].
 
-## 🎥 Project Demo
-[Insert link to a YouTube video demo or working prototype here]
-
-## 👥 The Team (Caffeinated Compilers)
-*   [Team Member 1 Name] - [Role]
-*   [Team Member 2 Name] - [Role]
-*   [Team Member 3 Name] - [Role]
+```mermaid
+flowchart LR
+    subgraph D["GHS Device"]
+        H["Camera · Display · Mic · Speaker · GPS"] --> C[Controller]
+    end
+    C -- "Wi-Fi / 4G" --> B
+    subgraph B["GHS Backend"]
+        E[Emergency Manager] --- L[Location Service]
+        E --- DC[Doctor Connection]
+        E --- A[AI Service]
+        E --- DB[(PostgreSQL)]
+    end
+    B --> AI[AI Assistant]
+    B --> DR[Doctor Dashboard]
+    B --> ES[Emergency Services]
