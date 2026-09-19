@@ -1,5 +1,5 @@
 <div align="center">
-    # ☕ Caffeinated Compilers | Celestia 2.0
+# ☕ Caffeinated Compilers | Celestia 2.0
 
 ## GHS: Golden Hour System
 
