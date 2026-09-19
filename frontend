@@ -1,1 +1,713 @@
+import tkinter as tk
+from tkinter import ttk
+import threading
+import base64
+import io
+import json
+import time
 
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
+
+
+# ============================================================
+# GHS DOCTOR TELEMEDICINE DASHBOARD
+# Pure Python / Tkinter
+# ============================================================
+
+class DoctorDashboard:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GHS Doctor Dashboard")
+        self.root.geometry("1400x850")
+        self.root.configure(bg="#0f172a")
+
+        self.running = True
+        self.video_photo = None
+        self.ws = None
+
+        self.setup_styles()
+        self.build_ui()
+
+        # Start emergency indicator animation
+        self.flash_indicator()
+
+        # Start WebSocket connection
+        if websocket:
+            threading.Thread(
+                target=self.connect_video,
+                daemon=True
+            ).start()
+
+    # ========================================================
+    # STYLING
+    # ========================================================
+
+    def setup_styles(self):
+        style = ttk.Style()
+
+        try:
+            style.theme_use("clam")
+        except:
+            pass
+
+        style.configure(
+            "TFrame",
+            background="#0f172a"
+        )
+
+        style.configure(
+            "Card.TFrame",
+            background="#1e293b"
+        )
+
+        style.configure(
+            "TLabel",
+            background="#0f172a",
+            foreground="white",
+            font=("Segoe UI", 11)
+        )
+
+        style.configure(
+            "Card.TLabel",
+            background="#1e293b",
+            foreground="white",
+            font=("Segoe UI", 11)
+        )
+
+    # ========================================================
+    # MAIN UI
+    # ========================================================
+
+    def build_ui(self):
+
+        # ----------------------------------------------------
+        # HEADER
+        # ----------------------------------------------------
+
+        header = tk.Frame(
+            self.root,
+            bg="#111827",
+            height=70
+        )
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        title = tk.Label(
+            header,
+            text="GHS Doctor Dashboard",
+            bg="#111827",
+            fg="white",
+            font=("Segoe UI", 24, "bold")
+        )
+        title.pack(side="left", padx=25)
+
+        self.emergency_label = tk.Label(
+            header,
+            text="● EMERGENCY ACTIVE",
+            bg="#111827",
+            fg="#ef4444",
+            font=("Segoe UI", 13, "bold")
+        )
+        self.emergency_label.pack(
+            side="right",
+            padx=30
+        )
+
+        # ----------------------------------------------------
+        # MAIN CONTENT
+        # ----------------------------------------------------
+
+        main = tk.Frame(
+            self.root,
+            bg="#0f172a"
+        )
+        main.pack(
+            fill="both",
+            expand=True,
+            padx=15,
+            pady=15
+        )
+
+        # LEFT SIDE
+        left = tk.Frame(
+            main,
+            bg="#0f172a"
+        )
+        left.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(0, 10)
+        )
+
+        # RIGHT SIDEBAR
+        right = tk.Frame(
+            main,
+            bg="#0f172a",
+            width=390
+        )
+        right.pack(
+            side="right",
+            fill="y"
+        )
+        right.pack_propagate(False)
+
+        self.create_video_panel(left)
+        self.create_chat_panel(left)
+
+        self.create_location_panel(right)
+        self.create_vitals_panel(right)
+        self.create_case_panel(right)
+
+    # ========================================================
+    # VIDEO PANEL
+    # ========================================================
+
+    def create_video_panel(self, parent):
+
+        container = tk.Frame(
+            parent,
+            bg="#1e293b",
+            highlightbackground="#334155",
+            highlightthickness=1
+        )
+
+        container.pack(
+            fill="both",
+            expand=True
+        )
+
+        title = tk.Label(
+            container,
+            text="LIVE PATIENT VIDEO",
+            bg="#1e293b",
+            fg="#38bdf8",
+            font=("Segoe UI", 13, "bold")
+        )
+        title.pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 5)
+        )
+
+        self.video_area = tk.Label(
+            container,
+            text="Waiting for video feed...\n\nWebSocket:\nws://localhost:8000/ws/video",
+            bg="#020617",
+            fg="#64748b",
+            font=("Segoe UI", 14),
+            justify="center"
+        )
+
+        self.video_area.pack(
+            fill="both",
+            expand=True,
+            padx=15,
+            pady=15
+        )
+
+        status = tk.Label(
+            container,
+            text="● VIDEO CONNECTION: CONNECTING",
+            bg="#1e293b",
+            fg="#facc15",
+            font=("Segoe UI", 10, "bold")
+        )
+
+        status.pack(
+            anchor="w",
+            padx=15,
+            pady=(0, 12)
+        )
+
+        self.video_status = status
+
+    # ========================================================
+    # AI CHAT PANEL
+    # ========================================================
+
+    def create_chat_panel(self, parent):
+
+        container = tk.Frame(
+            parent,
+            bg="#1e293b",
+            height=220
+        )
+
+        container.pack(
+            fill="x",
+            pady=(12, 0)
+        )
+
+        title = tk.Label(
+            container,
+            text="AI CHAT LOG",
+            bg="#1e293b",
+            fg="#a78bfa",
+            font=("Segoe UI", 13, "bold")
+        )
+        title.pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 5)
+        )
+
+        chat = tk.Text(
+            container,
+            bg="#020617",
+            fg="#e2e8f0",
+            insertbackground="white",
+            font=("Consolas", 10),
+            height=8,
+            wrap="word",
+            relief="flat"
+        )
+
+        chat.pack(
+            fill="both",
+            expand=True,
+            padx=15,
+            pady=(0, 15)
+        )
+
+        messages = [
+            "[AI] Hello. Please tell me what happened.",
+            "[PATIENT] I was involved in an accident.",
+            "[AI] Are you experiencing pain?",
+            "[PATIENT] Yes, I have pain in my chest.",
+            "[AI] Stay calm. A doctor is connecting now.",
+            "[AI] Emergency case forwarded to doctor."
+        ]
+
+        for message in messages:
+            chat.insert("end", message + "\n\n")
+
+        chat.config(state="disabled")
+
+    # ========================================================
+    # LOCATION PANEL
+    # ========================================================
+
+    def create_location_panel(self, parent):
+
+        container = tk.Frame(
+            parent,
+            bg="#1e293b"
+        )
+
+        container.pack(
+            fill="x",
+            pady=(0, 10)
+        )
+
+        title = tk.Label(
+            container,
+            text="PATIENT LOCATION",
+            bg="#1e293b",
+            fg="#38bdf8",
+            font=("Segoe UI", 13, "bold")
+        )
+
+        title.pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 8)
+        )
+
+        # Pure Python representation of map
+        map_area = tk.Frame(
+            container,
+            bg="#0b1220",
+            height=180
+        )
+
+        map_area.pack(
+            fill="x",
+            padx=15,
+            pady=5
+        )
+
+        map_area.pack_propagate(False)
+
+        tk.Label(
+            map_area,
+            text="📍",
+            bg="#0b1220",
+            fg="#ef4444",
+            font=("Segoe UI", 30)
+        ).place(
+            relx=0.5,
+            rely=0.42,
+            anchor="center"
+        )
+
+        tk.Label(
+            map_area,
+            text="PATIENT LOCATION",
+            bg="#0b1220",
+            fg="white",
+            font=("Segoe UI", 11, "bold")
+        ).place(
+            relx=0.5,
+            rely=0.68,
+            anchor="center"
+        )
+
+        # Mock GPS
+        coordinates = tk.Label(
+            container,
+            text="GPS: 12.9716° N, 80.2209° E",
+            bg="#1e293b",
+            fg="#94a3b8",
+            font=("Consolas", 10)
+        )
+
+        coordinates.pack(
+            anchor="w",
+            padx=15,
+            pady=(5, 12)
+        )
+
+    # ========================================================
+    # PATIENT VITALS
+    # ========================================================
+
+    def create_vitals_panel(self, parent):
+
+        container = tk.Frame(
+            parent,
+            bg="#1e293b"
+        )
+
+        container.pack(
+            fill="x",
+            pady=(0, 10)
+        )
+
+        tk.Label(
+            container,
+            text="PATIENT VITALS",
+            bg="#1e293b",
+            fg="#34d399",
+            font=("Segoe UI", 13, "bold")
+        ).pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 10)
+        )
+
+        vitals = [
+            ("Heart Rate", "104 BPM"),
+            ("SpO₂", "94%"),
+            ("Blood Pressure", "128/82"),
+            ("Temperature", "37.1 °C"),
+            ("Respiratory Rate", "20 / min")
+        ]
+
+        for name, value in vitals:
+
+            row = tk.Frame(
+                container,
+                bg="#1e293b"
+            )
+
+            row.pack(
+                fill="x",
+                padx=15,
+                pady=4
+            )
+
+            tk.Label(
+                row,
+                text=name,
+                bg="#1e293b",
+                fg="#94a3b8",
+                font=("Segoe UI", 10)
+            ).pack(side="left")
+
+            tk.Label(
+                row,
+                text=value,
+                bg="#1e293b",
+                fg="white",
+                font=("Segoe UI", 10, "bold")
+            ).pack(side="right")
+
+        tk.Frame(
+            container,
+            bg="#1e293b",
+            height=10
+        ).pack()
+
+    # ========================================================
+    # EMERGENCY CASE
+    # ========================================================
+
+    def create_case_panel(self, parent):
+
+        container = tk.Frame(
+            parent,
+            bg="#1e293b"
+        )
+
+        container.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            container,
+            text="EMERGENCY CASE",
+            bg="#1e293b",
+            fg="#fb7185",
+            font=("Segoe UI", 13, "bold")
+        ).pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 8)
+        )
+
+        details = [
+            ("Case ID", "GHS-2026-0912"),
+            ("Patient", "Emergency Patient"),
+            ("Priority", "CRITICAL"),
+            ("Hospital", "GHS Emergency Hospital"),
+            ("Status", "Doctor Connected")
+        ]
+
+        for key, value in details:
+
+            row = tk.Frame(
+                container,
+                bg="#1e293b"
+            )
+
+            row.pack(
+                fill="x",
+                padx=15,
+                pady=3
+            )
+
+            tk.Label(
+                row,
+                text=key,
+                bg="#1e293b",
+                fg="#94a3b8"
+            ).pack(side="left")
+
+            tk.Label(
+                row,
+                text=value,
+                bg="#1e293b",
+                fg="white",
+                font=("Segoe UI", 10, "bold")
+            ).pack(side="right")
+
+    # ========================================================
+    # EMERGENCY FLASHING INDICATOR
+    # ========================================================
+
+    def flash_indicator(self):
+
+        if not self.running:
+            return
+
+        current = self.emergency_label.cget("fg")
+
+        if current == "#ef4444":
+            self.emergency_label.config(
+                fg="#7f1d1d"
+            )
+        else:
+            self.emergency_label.config(
+                fg="#ef4444"
+            )
+
+        self.root.after(
+            500,
+            self.flash_indicator
+        )
+
+    # ========================================================
+    # WEBSOCKET VIDEO CONNECTION
+    # ========================================================
+
+    def connect_video(self):
+
+        if not websocket:
+            self.update_video_status(
+                "● VIDEO: websocket-client not installed",
+                "#ef4444"
+            )
+            return
+
+        try:
+
+            self.update_video_status(
+                "● VIDEO CONNECTION: CONNECTING",
+                "#facc15"
+            )
+
+            self.ws = websocket.create_connection(
+                "ws://localhost:8000/ws/video",
+                timeout=5
+            )
+
+            self.update_video_status(
+                "● VIDEO CONNECTION: CONNECTED",
+                "#22c55e"
+            )
+
+            while self.running:
+
+                data = self.ws.recv()
+
+                if not data:
+                    continue
+
+                self.process_video_frame(data)
+
+        except Exception as e:
+
+            self.update_video_status(
+                "● VIDEO CONNECTION: OFFLINE",
+                "#ef4444"
+            )
+
+    # ========================================================
+    # PROCESS VIDEO FRAME
+    # ========================================================
+
+    def process_video_frame(self, data):
+
+        try:
+
+            # JSON format:
+            # {"frame": "base64..."}
+
+            if isinstance(data, bytes):
+
+                try:
+                    data = data.decode("utf-8")
+                except:
+                    pass
+
+            if isinstance(data, str):
+
+                try:
+
+                    obj = json.loads(data)
+
+                    if "frame" in obj:
+                        encoded = obj["frame"]
+                    else:
+                        encoded = data
+
+                except json.JSONDecodeError:
+
+                    encoded = data
+
+            else:
+                return
+
+            image_data = base64.b64decode(encoded)
+
+            if Image is None:
+                return
+
+            image = Image.open(
+                io.BytesIO(image_data)
+            )
+
+            image.thumbnail(
+                (850, 500)
+            )
+
+            photo = ImageTk.PhotoImage(image)
+
+            self.root.after(
+                0,
+                self.display_frame,
+                photo
+            )
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # DISPLAY FRAME
+    # ========================================================
+
+    def display_frame(self, photo):
+
+        if not self.running:
+            return
+
+        self.video_photo = photo
+
+        self.video_area.config(
+            image=self.video_photo,
+            text=""
+        )
+
+    # ========================================================
+    # UPDATE STATUS
+    # ========================================================
+
+    def update_video_status(self, text, color):
+
+        def update():
+
+            if self.running:
+                self.video_status.config(
+                    text=text,
+                    fg=color
+                )
+
+        self.root.after(
+            0,
+            update
+        )
+
+    # ========================================================
+    # CLOSE APPLICATION
+    # ========================================================
+
+    def close(self):
+
+        self.running = False
+
+        try:
+            if self.ws:
+                self.ws.close()
+        except:
+            pass
+
+        self.root.destroy()
+
+
+# ============================================================
+# APPLICATION START
+# ============================================================
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+
+    app = DoctorDashboard(root)
+
+    root.protocol(
+        "WM_DELETE_WINDOW",
+        app.close
+    )
+
+    root.mainloop()
