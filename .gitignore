@@ -1,0 +1,23 @@
+# Environment Variables (Keep your API keys safe!)
+.env
+.env.local
+
+# Node.js / Frontend
+node_modules/
+npm-debug.log
+dist/
+build/
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
