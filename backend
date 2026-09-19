@@ -1,1 +1,451 @@
+"""
+app.py — FastAPI backend for an IoT safety dashboard (hackathon prototype).
 
+Endpoints
+---------
+POST /api/chat            JSON {"message": "..."} -> short, safety-oriented Gemini reply
+WS   /ws/video?role=device  IoT camera publishes frames (raw bytes or base64 text)
+WS   /ws/video?role=viewer  Dashboard clients receive {"type":"frame","data":"<base64>"}
+GET  /api/health          liveness + which Gemini backend loaded
+GET  /api/stream/status   viewer/device counts, frame counter
+GET  /dashboard           minimal built-in test viewer (handy for debugging the stream)
+
+Everything is in memory. No database, no persistence — restart wipes all state.
+
+Setup
+-----
+    pip install "fastapi>=0.110" "uvicorn[standard]" google-genai
+    export GEMINI_API_KEY="your-key-here"      # Windows: set GEMINI_API_KEY=...
+    python app.py
+
+NOTE ON THE SDK: the `google-generativeai` package is deprecated (end-of-life
+30 Nov 2025) and Gemini 1.5/2.0 model endpoints now return 404. This file prefers
+the current `google-genai` SDK and falls back to the legacy one only if that's
+all that's installed. To force the legacy path, install `google-generativeai`
+instead and set GEMINI_MODEL to a model it can still reach.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import socket
+import time
+from typing import Optional, Set
+
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+# gemini-3.5-flash-lite is the cheap/fast GA option; gemini-3.7-flash or
+# gemini-3.8-flash if you want more reasoning. Override with GEMINI_MODEL.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
+MAX_MESSAGE_CHARS = 4000
+MAX_FRAME_BYTES = 4 * 1024 * 1024  # drop absurd frames instead of OOMing
+VIEWER_SEND_TIMEOUT = 2.0          # seconds; a viewer slower than this is dropped
+
+SYSTEM_INSTRUCTION = (
+    "You are the safety assistant for a live IoT monitoring dashboard. "
+    "Reply in at most three short sentences of plain text. No markdown, no lists. "
+    "Lead with the single most important action the person should take right now. "
+    "Stay calm, concrete and specific. Never speculate about what the camera sees — "
+    "you cannot see it. If the message describes a real emergency (injury, fire, gas, "
+    "flooding, violence, or anyone in immediate danger), the first thing you say is to "
+    "contact local emergency services."
+)
+
+FALLBACK_REPLY = (
+    "The assistant is offline right now. If anyone is in immediate danger, "
+    "contact local emergency services first, then move to a safe location."
+)
+
+# --------------------------------------------------------------------------
+# Gemini wrapper — supports both SDKs so the endpoint code stays identical
+# --------------------------------------------------------------------------
+
+
+class GeminiChat:
+    """Small adapter over whichever Gemini SDK is installed."""
+
+    def __init__(self, api_key: Optional[str], model: str) -> None:
+        self.model = model
+        self.backend: Optional[str] = None
+        self._client = None          # google-genai
+        self._types = None
+        self._legacy_model = None    # google-generativeai
+
+        if not api_key:
+            return
+
+        # Preferred: current unified SDK (pip install google-genai)
+        try:
+            from google import genai
+            from google.genai import types
+
+            self._client = genai.Client(api_key=api_key)
+            self._types = types
+            self.backend = "google-genai"
+            return
+        except ImportError:
+            pass
+
+        # Fallback: deprecated SDK (pip install google-generativeai)
+        try:
+            import google.generativeai as legacy_genai
+
+            legacy_genai.configure(api_key=api_key)
+            self._legacy_model = legacy_genai.GenerativeModel(
+                model_name=self.model,
+                system_instruction=SYSTEM_INSTRUCTION,
+            )
+            self.backend = "google-generativeai (deprecated)"
+        except ImportError:
+            pass
+
+    @property
+    def ready(self) -> bool:
+        return self.backend is not None
+
+    async def reply(self, message: str) -> str:
+        """Both SDKs are blocking, so run them off the event loop."""
+        if not self.ready:
+            raise RuntimeError("No Gemini SDK loaded or GEMINI_API_KEY is unset.")
+        if self.backend == "google-genai":
+            return await asyncio.to_thread(self._reply_new, message)
+        return await asyncio.to_thread(self._reply_legacy, message)
+
+    def _reply_new(self, message: str) -> str:
+        config = self._types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=0.3,
+            # Keep this roomy: Gemini 3.x spends tokens on internal reasoning
+            # before the visible answer, and a tight cap can return empty text.
+            # To cut latency further, add:
+            #   thinking_config=self._types.ThinkingConfig(thinking_level="minimal")
+            max_output_tokens=800,
+        )
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=message,
+            config=config,
+        )
+        return (getattr(response, "text", "") or "").strip()
+
+    def _reply_legacy(self, message: str) -> str:
+        response = self._legacy_model.generate_content(message)
+        return (getattr(response, "text", "") or "").strip()
+
+
+gemini = GeminiChat(GEMINI_API_KEY, GEMINI_MODEL)
+
+# --------------------------------------------------------------------------
+# In-memory video hub
+# --------------------------------------------------------------------------
+
+
+class VideoHub:
+    """Fan-out relay: devices push frames in, viewers get them broadcast out."""
+
+    def __init__(self) -> None:
+        self.viewers: Set[WebSocket] = set()
+        self.devices: Set[WebSocket] = set()
+        self.latest_frame: Optional[str] = None   # base64 string
+        self.latest_frame_at: Optional[float] = None
+        self.frames_received = 0
+        self.frames_dropped = 0
+        self._lock = asyncio.Lock()
+
+    async def add(self, ws: WebSocket, role: str) -> None:
+        async with self._lock:
+            (self.devices if role == "device" else self.viewers).add(ws)
+
+    async def remove(self, ws: WebSocket) -> None:
+        async with self._lock:
+            self.viewers.discard(ws)
+            self.devices.discard(ws)
+
+    async def broadcast(self, frame_b64: str) -> None:
+        self.latest_frame = frame_b64
+        self.latest_frame_at = time.time()
+        self.frames_received += 1
+
+        async with self._lock:
+            targets = list(self.viewers)
+        if not targets:
+            return
+
+        payload = {"type": "frame", "data": frame_b64, "ts": self.latest_frame_at}
+        results = await asyncio.gather(
+            *(self._send(ws, payload) for ws in targets),
+            return_exceptions=True,
+        )
+
+        stale = [ws for ws, ok in zip(targets, results) if ok is not True]
+        if stale:
+            async with self._lock:
+                for ws in stale:
+                    self.viewers.discard(ws)
+
+    async def _send(self, ws: WebSocket, payload: dict) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=VIEWER_SEND_TIMEOUT)
+            return True
+        except Exception:
+            # Slow or dead viewer: drop it rather than stall every other client.
+            self.frames_dropped += 1
+            return False
+
+    def status(self) -> dict:
+        return {
+            "viewers": len(self.viewers),
+            "devices": len(self.devices),
+            "frames_received": self.frames_received,
+            "frames_dropped": self.frames_dropped,
+            "last_frame_age_s": (
+                round(time.time() - self.latest_frame_at, 2)
+                if self.latest_frame_at
+                else None
+            ),
+        }
+
+
+hub = VideoHub()
+
+# --------------------------------------------------------------------------
+# App + CORS
+# --------------------------------------------------------------------------
+
+app = FastAPI(title="IoT Safety Dashboard API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    # Must stay False while allow_origins is "*" — browsers reject the wildcard
+    # on credentialed requests. Flip both if you ever add cookie auth.
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Heads-up: CORS does not apply to WebSockets. Browsers send an Origin header on
+# the handshake but do not enforce CORS on it, so /ws/video is reachable from any
+# page by design. Fine for a LAN prototype; add a token check before shipping.
+
+# --------------------------------------------------------------------------
+# Chat
+# --------------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    model: str
+    degraded: bool = False
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message must not be empty")
+
+    if not gemini.ready:
+        # Never hard-fail a safety UI just because the key is missing.
+        return ChatResponse(reply=FALLBACK_REPLY, model=GEMINI_MODEL, degraded=True)
+
+    try:
+        reply = await gemini.reply(message)
+    except Exception as exc:  # network error, quota, safety block, bad model name
+        print(f"[chat] Gemini call failed: {type(exc).__name__}: {exc}")
+        return ChatResponse(reply=FALLBACK_REPLY, model=GEMINI_MODEL, degraded=True)
+
+    if not reply:
+        # Empty text usually means the response was blocked or hit the token cap.
+        return ChatResponse(reply=FALLBACK_REPLY, model=GEMINI_MODEL, degraded=True)
+
+    return ChatResponse(reply=reply, model=GEMINI_MODEL)
+
+
+# --------------------------------------------------------------------------
+# Video relay
+# --------------------------------------------------------------------------
+
+
+def _normalize_frame(raw: object) -> Optional[str]:
+    """Accept raw bytes, a bare base64 string, or {"frame"/"data"/"image": "..."}."""
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > MAX_FRAME_BYTES:
+            return None
+        return base64.b64encode(raw).decode("ascii")
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or len(text) > MAX_FRAME_BYTES:
+            return None
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                return None
+            for key in ("frame", "data", "image", "b64"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    text = value
+                    break
+            else:
+                return None
+        # Strip a data-URI prefix if the device sends one.
+        if text.startswith("data:") and "," in text:
+            text = text.split(",", 1)[1]
+        return text
+
+    return None
+
+
+@app.websocket("/ws/video")
+async def video_socket(
+    websocket: WebSocket,
+    role: str = Query("viewer", description="'device' to publish, 'viewer' to watch"),
+) -> None:
+    role = "device" if role.lower() in {"device", "publisher", "camera", "iot"} else "viewer"
+
+    await websocket.accept()
+    await hub.add(websocket, role)
+    print(f"[ws] {role} connected  ->  {hub.status()}")
+
+    try:
+        if role == "viewer":
+            # Give a fresh dashboard something to show immediately.
+            await websocket.send_json({"type": "hello", "role": "viewer", **hub.status()})
+            if hub.latest_frame:
+                await websocket.send_json(
+                    {"type": "frame", "data": hub.latest_frame, "ts": hub.latest_frame_at}
+                )
+            # Viewers only listen; this loop exists to detect disconnects.
+            while True:
+                await websocket.receive_text()
+        else:
+            await websocket.send_json({"type": "hello", "role": "device"})
+            while True:
+                packet = await websocket.receive()
+                if packet.get("type") == "websocket.disconnect":
+                    break
+                raw = packet.get("bytes") if packet.get("bytes") is not None else packet.get("text")
+                frame = _normalize_frame(raw)
+                if frame is None:
+                    hub.frames_dropped += 1
+                    continue
+                await hub.broadcast(frame)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[ws] {role} error: {type(exc).__name__}: {exc}")
+    finally:
+        await hub.remove(websocket)
+        print(f"[ws] {role} disconnected  ->  {hub.status()}")
+
+
+# --------------------------------------------------------------------------
+# Meta + built-in test viewer
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    return {
+        "status": "ok",
+        "gemini_backend": gemini.backend or "unavailable",
+        "gemini_ready": gemini.ready,
+        "model": GEMINI_MODEL,
+    }
+
+
+@app.get("/api/stream/status")
+async def stream_status() -> dict:
+    return hub.status()
+
+
+DASHBOARD_HTML = """<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream test</title>
+<style>
+  body{font:15px system-ui,sans-serif;margin:0;padding:1.5rem;background:#111;color:#eee}
+  img{width:100%;max-width:720px;background:#000;border-radius:8px;display:block}
+  #s{margin-top:.75rem;color:#9ad}
+</style>
+<h2>Live feed</h2>
+<img id="f" alt="waiting for frames">
+<div id="s">connecting…</div>
+<script>
+  const img = document.getElementById('f'), status = document.getElementById('s');
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/video?role=viewer`);
+  let n = 0;
+  ws.onopen = () => status.textContent = 'connected';
+  ws.onclose = () => status.textContent = 'disconnected';
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type !== 'frame') return;
+    img.src = 'data:image/jpeg;base64,' + m.data;
+    status.textContent = `${++n} frames`;
+  };
+</script>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return DASHBOARD_HTML
+
+
+@app.get("/")
+async def root() -> dict:
+    return {
+        "service": "IoT Safety Dashboard API",
+        "endpoints": ["/api/chat", "/ws/video", "/api/health", "/api/stream/status", "/dashboard"],
+        "docs": "/docs",
+    }
+
+
+# --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN address, so you know what URL to hand the IoT device."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))  # no packets sent; just picks the route
+        return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    ip = _lan_ip()
+    print(f"\n  API      http://{ip}:{PORT}")
+    print(f"  Viewer   http://{ip}:{PORT}/dashboard")
+    print(f"  Device   ws://{ip}:{PORT}/ws/video?role=device")
+    print(f"  Gemini   {gemini.backend or 'UNAVAILABLE — set GEMINI_API_KEY'}\n")
+
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
