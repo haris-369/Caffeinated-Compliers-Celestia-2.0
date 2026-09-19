@@ -1,5 +1,6 @@
 <div align="center">
-
+# ☕ Caffeinated Compilers | Celestia 2.0
+    
 # ☕ GHS: Golden Hour System
 
 ### A compact IoT emergency communication device that connects a person in distress to an AI assistant and, when available, a remote doctor, with live voice, video and location.
