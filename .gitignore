@@ -1,23 +1,40 @@
-# Environment Variables (Keep your API keys safe!)
+# =========================
+# GHS Project .gitignore
+# =========================
+
+# Environment Variables & Secrets (CRITICAL)
 .env
-.env.local
+.env.*
+*.pem
+*.key
+credentials.json
 
-# Node.js / Frontend
-node_modules/
-npm-debug.log
-dist/
-build/
-
-# Python / Backend
+# Python / FastAPI Backend
 __pycache__/
 *.py[cod]
+*$py.class
 venv/
 .venv/
+env/
+pip-log.txt
 
-# OS generated files
+# Node.js / Web Frontend
+node_modules/
+dist/
+build/
+.next/
+npm-debug.log*
+
+# Raspberry Pi / Hardware Logs
+*.log
+*.sqlite3
+
+# OS Generated Files
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # IDEs and Editors
 .vscode/
 .idea/
+*.swp
